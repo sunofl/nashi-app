@@ -1,0 +1,134 @@
+name: macOS archive quarantine evidence
+on:
+  push:
+    branches: [codex/quarantine-evidence-macos26]
+permissions:
+  contents: read
+jobs:
+  quarantine:
+    if: github.repository == 'sunofl/nashi-app'
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact baseline
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: orkunisitmak/nashi-app
+          ref: 59ef4d6d219b34dd1871f9d0c7103dfbde97ff3a
+          path: baseline
+          persist-credentials: false
+      - name: Checkout exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: sunofl/nashi-app
+          ref: e20b04853700b04c00752f76c00d53b99734f4d3
+          path: candidate
+          persist-credentials: false
+      - name: Compare archive quarantine at both commits
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          sw_vers
+          swift --version
+          probe="$RUNNER_TEMP/nashi-quarantine-probe.py"
+          cat > "$probe" <<'PYTHON'
+          #!/usr/bin/env python3
+          """Compare archive quarantine through the CLI using macOS xattr as the oracle."""
+          import io
+          import json
+          import pathlib
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          
+          XATTR = "/usr/bin/xattr"
+          KEY = "com.apple.quarantine"
+          MARKER = b"0081;65000000;NashiEvidence;"
+          ITEM = "Example.app/Contents/MacOS/Example"
+          PAYLOAD = b"Harmless quarantine test fixture\n"
+          
+          
+          def read_marker(path):
+              """Read raw quarantine bytes or report that the attribute is absent."""
+              result = subprocess.run([XATTR, "-px", KEY, str(path)], capture_output=True, text=True)
+              if result.returncode and "No such xattr" in result.stderr:
+                  return None
+              if result.returncode:
+                  raise RuntimeError(result.stderr.strip())
+              return bytes.fromhex(result.stdout)
+          
+          
+          def output_path(binary, operation, value, source):
+              """Run the public CLI operation and require one output in the test directory."""
+              result = subprocess.run(
+                  [binary, operation, value, str(source), "--json"], capture_output=True, text=True
+              )
+              if result.returncode:
+                  raise RuntimeError(f"{operation} {value} failed: {result.stderr.strip()}")
+              outputs = json.loads(result.stdout)
+              if len(outputs) != 1:
+                  raise RuntimeError(f"{operation} {value} did not produce one output: {outputs!r}")
+              path = pathlib.Path(outputs[0]).resolve(strict=True)
+              if source.parent.resolve() not in path.parents:
+                  raise RuntimeError(f"Output was outside the fixture directory: {path}")
+              return path
+          
+          
+          def main(binary, revision, expectation):
+              """Exercise archive extraction and repack with an independently marked fixture."""
+              if sys.platform != "darwin":
+                  raise RuntimeError("The quarantine probe requires macOS.")
+              if expectation not in ("unmarked", "preserved"):
+                  raise ValueError(f"Unknown expectation: {expectation}")
+              with tempfile.TemporaryDirectory(prefix="nashi-quarantine-") as directory:
+                  source = pathlib.Path(directory) / "Downloaded.tar"
+                  with tarfile.open(source, "w", format=tarfile.USTAR_FORMAT) as archive:
+                      entry = tarfile.TarInfo(ITEM)
+                      entry.mode = 0o755
+                      entry.size = len(PAYLOAD)
+                      archive.addfile(entry, io.BytesIO(PAYLOAD))
+                  subprocess.run([XATTR, "-wx", KEY, MARKER.hex(), str(source)], check=True)
+                  if read_marker(source) != MARKER:
+                      raise RuntimeError("The archive fixture could not be marked.")
+                  extracted = output_path(binary, "tool", "extractArchive", source)
+                  repacked = output_path(binary, "convert", "zip", source)
+                  executable = extracted / ITEM
+                  if executable.read_bytes() != PAYLOAD or not executable.stat().st_mode & 0o111:
+                      raise RuntimeError("Extraction did not retain the harmless executable fixture.")
+                  with tarfile.open(source) as original:
+                      if original.extractfile(ITEM).read() != PAYLOAD or read_marker(source) != MARKER:
+                          raise RuntimeError("The source archive changed.")
+                  observed = {
+                      "extraction_root": read_marker(extracted),
+                      "implicit_app_bundle": read_marker(extracted / "Example.app"),
+                      "extracted_executable": read_marker(executable),
+                      "repacked_zip": read_marker(repacked),
+                  }
+                  summary = {
+                      name: ("unmarked" if marker is None else "preserved" if marker == MARKER else "different")
+                      for name, marker in observed.items()
+                  }
+                  print(json.dumps({"revision": revision, "expected": expectation, **summary}, sort_keys=True), flush=True)
+                  if any(status != expectation for status in summary.values()):
+                      raise SystemExit(f"Unexpected quarantine result for {revision}.")
+          
+          
+          if __name__ == "__main__":
+              main(*sys.argv[1:])
+          PYTHON
+          compare() {
+            local folder="$1" expected_sha="$2" expectation="$3" actual_sha bin
+            actual_sha="$(git -C "$folder" rev-parse HEAD)"
+            test "$actual_sha" = "$expected_sha"
+            echo "::group::$folder $actual_sha ($expectation)"
+            swift build --package-path "$folder" --product nashi-cli
+            bin="$(swift build --package-path "$folder" --show-bin-path)/nashi-cli"
+            python3 "$probe" "$bin" "$actual_sha" "$expectation"
+            echo "::endgroup::"
+          }
+          compare baseline 59ef4d6d219b34dd1871f9d0c7103dfbde97ff3a unmarked
+          compare candidate e20b04853700b04c00752f76c00d53b99734f4d3 preserved
+
